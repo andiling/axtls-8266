@@ -140,32 +140,43 @@ void DISPLAY_BYTES(SSL *ssl, const char *format,
 #endif
 
 /**
- * Allocates new SSL extensions structure and returns pointer to it
+ * Allocate new SSL extensions structure and return pointer to it
  *
  */
 EXP_FUNC SSL_EXTENSIONS * STDCALL ssl_ext_new()
 {
-    SSL_EXTENSIONS *ssl_ext = (SSL_EXTENSIONS *)malloc(sizeof(SSL_EXTENSIONS));
-    ssl_ext->max_fragment_size = 0;
-    ssl_ext->host_name = NULL;
-
-    return ssl_ext;
+    return (SSL_EXTENSIONS *)calloc(1, sizeof(SSL_EXTENSIONS));
 }
 
 /**
- * Allocates new SSL extensions structure and returns pointer to it
+ * Free SSL extensions structure
  *
  */
 EXP_FUNC void STDCALL ssl_ext_free(SSL_EXTENSIONS *ssl_ext)
 {
-    if(ssl_ext == NULL ) {
+    if (ssl_ext == NULL ) 
+    {
         return;
     }
 
-    if(ssl_ext->host_name != NULL) {
-        free(ssl_ext->host_name);
-    }
     free(ssl_ext);
+}
+
+EXP_FUNC void STDCALL ssl_ext_set_host_name(SSL_EXTENSIONS * ext, const char* host_name)
+{
+    free(ext->host_name);
+    ext->host_name = NULL;
+    if (host_name) {
+        ext->host_name = strdup(host_name);
+    }
+}
+
+/**
+ * Set the maximum fragment size for the fragment size negotiation extension
+ */
+EXP_FUNC void STDCALL ssl_ext_set_max_fragment_size(SSL_EXTENSIONS * ext, unsigned fragment_size)
+{
+    ext->max_fragment_size = fragment_size;
 }
 
 /**
@@ -511,6 +522,15 @@ EXP_FUNC const char * STDCALL ssl_get_cert_dn(const SSL *ssl, int component)
         case SSL_X509_CERT_ORGANIZATIONAL_NAME:       
             return ssl->x509_ctx->cert_dn[X509_ORGANIZATIONAL_UNIT];
 
+        case SSL_X509_CERT_LOCATION:       
+            return ssl->x509_ctx->cert_dn[X509_LOCATION];
+
+        case SSL_X509_CERT_COUNTRY:       
+            return ssl->x509_ctx->cert_dn[X509_COUNTRY];
+
+        case SSL_X509_CERT_STATE:       
+            return ssl->x509_ctx->cert_dn[X509_STATE];
+
         case SSL_X509_CA_CERT_COMMON_NAME:
             return ssl->x509_ctx->ca_cert_dn[X509_COMMON_NAME];
 
@@ -519,6 +539,15 @@ EXP_FUNC const char * STDCALL ssl_get_cert_dn(const SSL *ssl, int component)
 
         case SSL_X509_CA_CERT_ORGANIZATIONAL_NAME:       
             return ssl->x509_ctx->ca_cert_dn[X509_ORGANIZATIONAL_UNIT];
+
+        case SSL_X509_CA_CERT_LOCATION:       
+            return ssl->x509_ctx->ca_cert_dn[X509_LOCATION];
+
+        case SSL_X509_CA_CERT_COUNTRY:       
+            return ssl->x509_ctx->ca_cert_dn[X509_COUNTRY];
+
+        case SSL_X509_CA_CERT_STATE:       
+            return ssl->x509_ctx->ca_cert_dn[X509_STATE];
 
         default:
             return NULL;
@@ -718,7 +747,7 @@ static void add_hmac_digest(SSL *ssl, int mode, uint8_t *hmac_header,
         const uint8_t *buf, int buf_len, uint8_t *hmac_buf)
 {
     int hmac_len = buf_len + 8 + SSL_RECORD_SIZE;
-    uint8_t *t_buf = (uint8_t *)malloc(buf_len+100);
+    uint8_t *t_buf = (uint8_t *)malloc(hmac_len);
 
     memcpy(t_buf, (mode == SSL_SERVER_WRITE || mode == SSL_CLIENT_WRITE) ? 
                     ssl->write_sequence : ssl->read_sequence, 8);
@@ -920,8 +949,8 @@ static void prf(SSL *ssl, const uint8_t *sec, int sec_len,
     {
         int len, i;
         const uint8_t *S1, *S2;
-        uint8_t xbuf[256]; /* needs to be > the amount of key data */
-        uint8_t ybuf[256]; /* needs to be > the amount of key data */
+        uint8_t xbuf[2*(SHA256_SIZE+32+16) + MD5_SIZE]; /* max keyblock */
+        uint8_t ybuf[2*(SHA256_SIZE+32+16) + SHA1_SIZE]; /* max keyblock */
 
         len = sec_len/2;
         S1 = sec;
@@ -1374,7 +1403,7 @@ int basic_read(SSL *ssl, uint8_t **in_data)
     if (IS_SET_SSL_FLAG(SSL_NEED_RECORD))
     {
         /* check for sslv2 "client hello" */
-        if (buf[0] & 0x80 && buf[2] == 1)
+        if ((buf[0] & 0x80) && buf[2] == 1)
         {
 #ifdef CONFIG_SSL_FULL_MODE
             printf("Error: no SSLv23 handshaking allowed\n");
@@ -2061,8 +2090,11 @@ error:
 EXP_FUNC int STDCALL ssl_verify_cert(const SSL *ssl)
 {
     int ret;
+    int pathLenConstraint = 0;
+
     SSL_CTX_LOCK(ssl->ssl_ctx->mutex);
-    ret = x509_verify(ssl->ssl_ctx->ca_cert_ctx, ssl->x509_ctx);
+    ret = x509_verify(ssl->ssl_ctx->ca_cert_ctx, ssl->x509_ctx,
+            &pathLenConstraint);
     SSL_CTX_UNLOCK(ssl->ssl_ctx->mutex);
 
     if (ret)        /* modify into an SSL error type */
@@ -2090,6 +2122,8 @@ int process_certificate(SSL *ssl, X509_CTX **x509_ctx)
     int num_certs = 0;
     int i = 0;
     offset += 2;
+
+    ax_wdt_feed();
 
     PARANOIA_CHECK(pkt_size, total_cert_len + offset);
 
@@ -2121,13 +2155,17 @@ int process_certificate(SSL *ssl, X509_CTX **x509_ctx)
         offset++;       /* skip empty char */
         cert_size = (buf[offset]<<8) + buf[offset+1];
         offset += 2;
-        
+        ax_wdt_feed();
         if (x509_new(&buf[offset], NULL, certs+num_certs))
         {
             ret = SSL_ERROR_BAD_CERTIFICATE;
             goto error;
         }
 
+#if defined (CONFIG_SSL_FULL_MODE)
+        if (ssl->ssl_ctx->options & SSL_DISPLAY_CERTS)
+            x509_print(certs[num_certs], NULL);
+#endif
         num_certs++;
         offset += cert_size;
     }
@@ -2147,6 +2185,7 @@ int process_certificate(SSL *ssl, X509_CTX **x509_ctx)
         {
             if (certs[i] == chain) 
                 continue;
+
             if (cert_used[i]) 
                 continue; // don't allow loops
 
@@ -2425,10 +2464,6 @@ EXP_FUNC void STDCALL ssl_display_error(int error_code)
 
     printf("\n");
 }
-
-/**
- * Debugging routine to display alerts.
- */
 
 /**
  * Debugging routine to display alerts.
